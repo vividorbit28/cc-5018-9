@@ -1,0 +1,195 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<title>地区直播按需中继 · 控制台</title>
+<style>
+  :root { --bg:#0f1420; --card:#171e2e; --line:#263149; --txt:#dce4f5;
+          --muted:#8593ad; --ok:#38d39f; --warn:#f5a623; --err:#ff6b6b;
+          --info:#5aa7ff; }
+  * { box-sizing: border-box; }
+  body { margin:0; background:var(--bg); color:var(--txt);
+         font:14px/1.5 -apple-system,Segoe UI,Roboto,"Helvetica Neue",sans-serif; }
+  header { padding:16px 24px; border-bottom:1px solid var(--line);
+           display:flex; align-items:baseline; gap:16px; flex-wrap:wrap; }
+  header h1 { font-size:18px; margin:0; }
+  header .meta { color:var(--muted); font-size:12px; }
+  main { padding:20px 24px; display:grid; gap:18px; }
+  .region { background:var(--card); border:1px solid var(--line);
+            border-radius:12px; padding:16px; }
+  .region h2 { margin:0 0 10px; font-size:16px; display:flex;
+               align-items:center; gap:10px; flex-wrap:wrap; }
+  .pill { font-size:12px; padding:2px 10px; border-radius:999px;
+          border:1px solid var(--line); color:var(--muted); }
+  .pill.IDLE { color:var(--muted); }
+  .pill.CONNECTING { color:var(--info); border-color:var(--info); }
+  .pill.PLAYING { color:var(--ok); border-color:var(--ok); }
+  .pill.FAILED { color:var(--err); border-color:var(--err); }
+  .pill.RETAINING { color:var(--warn); border-color:var(--warn); }
+  .stats { display:grid; grid-template-columns:repeat(auto-fit,minmax(150px,1fr));
+           gap:8px; margin:10px 0; }
+  .stat { background:#10172500; border:1px solid var(--line); border-radius:8px;
+          padding:8px 10px; }
+  .stat b { display:block; font-size:16px; }
+  .stat span { color:var(--muted); font-size:12px; }
+  .controls { display:flex; gap:8px; flex-wrap:wrap; margin:10px 0; }
+  button { background:#22304d; color:var(--txt); border:1px solid #33456b;
+           border-radius:8px; padding:7px 14px; cursor:pointer; font-size:13px; }
+  button:hover { background:#2b3c61; }
+  button.danger { background:#3a2230; border-color:#6b3345; }
+  button:disabled { opacity:.5; cursor:wait; }
+  .viewers { display:grid; gap:10px;
+           grid-template-columns:repeat(auto-fill,minmax(240px,1fr)); }
+  .viewer { border:1px solid var(--line); border-radius:10px; padding:10px;
+            background:#101726; }
+  .viewer .top { display:flex; justify-content:space-between; align-items:center;
+                 margin-bottom:6px; }
+  .viewer img { width:100%; aspect-ratio:16/9; background:#000;
+                border-radius:6px; object-fit:cover; }
+  .viewer .kv { color:var(--muted); font-size:12px; margin-top:6px;
+                display:grid; grid-template-columns:1fr auto; gap:2px 8px; }
+  .bar { height:6px; background:#0c1220; border-radius:3px; overflow:hidden;
+         margin-top:6px; }
+  .bar i { display:block; height:100%; background:var(--info); }
+  .bar i.hot { background:var(--err); }
+  .empty { color:var(--muted); font-size:13px; padding:8px 0; }
+  #toast { position:fixed; right:20px; bottom:20px; max-width:380px; }
+  #toast .t { background:#2a1c24; border:1px solid var(--err); color:#ffd7d7;
+              padding:10px 14px; border-radius:8px; margin-top:8px; font-size:13px; }
+  #toast .t.ok { background:#16281f; border-color:var(--ok); color:#c9f5e6; }
+</style>
+</head>
+<body>
+<header>
+  <h1>地区直播按需中继 · 控制台</h1>
+  <span class="meta">同一地区共享一条上游连接 · 首帧关键帧边界 · 独立有界队列 · 空闲保留期回收</span>
+  <span class="meta" id="poll-meta"></span>
+</header>
+<main id="regions"></main>
+<div id="toast"></div>
+
+<script>
+const $ = (s, el=document) => el.querySelector(s);
+const toast = (msg, ok=false) => {
+  const box = $("#toast");
+  const d = document.createElement("div");
+  d.className = "t" + (ok ? " ok" : "");
+  d.textContent = msg;
+  box.appendChild(d);
+  setTimeout(() => d.remove(), 4000);
+};
+
+async function api(path, method="GET", body) {
+  const resp = await fetch(path, {
+    method,
+    headers: {"Content-Type": "application/json"},
+    body: body ? JSON.stringify(body) : undefined,
+  });
+  const data = await resp.json().catch(() => ({}));
+  if (!resp.ok) throw new Error(data.error || resp.statusText);
+  return data;
+}
+
+async function addViewer(region, slow) {
+  try {
+    await api("/api/subscribers", "POST", {region, slow});
+    toast(`已向 ${region} 增加${slow ? " 慢速" : ""}订阅端`, true);
+  } catch (e) { toast(`增加订阅失败：${e.message}`); }
+}
+
+async function stopViewer(region, id) {
+  try {
+    await api("/api/subscribers/stop", "POST", {region, worker_id: id});
+    toast(`已停止订阅端 ${id}`, true);
+  } catch (e) { toast(`停止失败：${e.message}`); }
+}
+
+async function sourceOutage(region, cport) {
+  try {
+    const resp = await fetch(`http://127.0.0.1:${cport}/control/die`,
+                             {method: "POST"});
+    if (!resp.ok) throw new Error(resp.statusText);
+    toast(`已触发 ${region} 源站短断，监督者将自动重启`);
+  } catch (e) { toast(`源站短断触发失败：${e.message}`); }
+}
+
+function statCard(label, value) {
+  return `<div class="stat"><b>${value}</b><span>${label}</span></div>`;
+}
+
+function viewerCard(region, v) {
+  const q = v.queue_fill_pct || 0;
+  const img = v.jpeg_b64
+    ? `src="data:image/jpeg;base64,${v.jpeg_b64}"`
+    : `alt="等待首帧..."`;
+  return `<div class="viewer">
+    <div class="top">
+      <span>${v.worker_id}${v.slow ? ' <span class="pill">慢速</span>' : ''}</span>
+      <button class="danger" onclick="stopViewer('${region}','${v.worker_id}')">停止</button>
+    </div>
+    <img ${img}>
+    <div class="kv">
+      <span>首帧耗时</span><b>${v.first_frame_ms ?? '—'} ms</b>
+      <span>已解码帧</span><b>${v.frames_decoded}</b>
+      <span>已收 AU</span><b>${v.au_received}</b>
+      <span>本端丢帧</span><b>${v.dropped_for_this_viewer}</b>
+      <span>队列 ${v.queue_size}/${v.queue_capacity}</span><b>${q}%</b>
+    </div>
+    <div class="bar"><i class="${q>80?'hot':''}" style="width:${q}%"></i></div>
+  </div>`;
+}
+
+function regionCard(r, cfg) {
+  const cport = cfg.regions[r.region].control_port;
+  const viewers = r.viewers.length
+    ? `<div class="viewers">${r.viewers.map(v => viewerCard(r.region, v)).join("")}</div>`
+    : `<div class="empty">当前无观众（上游状态：${r.state}）</div>`;
+  return `<section class="region">
+    <h2>地区 ${r.region}
+      <span class="pill ${r.state}">${r.state}</span>
+      <span class="meta">源站 ${r.source}</span>
+      ${r.retain_seconds_left != null ?
+        `<span class="pill RETAINING">保留期倒计时 ${r.retain_seconds_left}s</span>` : ""}
+    </h2>
+    <div class="stats">
+      ${statCard("上游连接累计", r.upstream_established)}
+      ${statCard("当前上游", r.upstream_live ? "1 条" : "0 条")}
+      ${statCard("观众数", r.viewer_count)}
+      ${statCard("已转发 AU", r.access_units)}
+      ${statCard("上游字节", (r.upstream_bytes/1024).toFixed(1) + " KB")}
+      ${statCard("断线重试", r.retry_count)}
+    </div>
+    ${r.last_error ? `<div class="empty" style="color:var(--err)">最近错误：${r.last_error}</div>` : ""}
+    <div class="controls">
+      <button onclick="addViewer('${r.region}', false)">增加订阅端</button>
+      <button onclick="addViewer('${r.region}', true)">增加慢速订阅端</button>
+      <button class="danger" onclick="sourceOutage('${r.region}', ${cport})">
+        模拟源站短断
+      </button>
+    </div>
+    ${viewers}
+  </section>`;
+}
+
+let CFG = null;
+async function poll() {
+  try {
+    const [topo] = await Promise.all([
+      api("/api/topology"),
+      CFG || (CFG = api("/api/config").catch(() => null)),
+    ]);
+    if (!CFG) CFG = {regions: Object.fromEntries(
+      topo.regions.map(r => [r.region, {control_port: 0}]))};
+    $("#regions").innerHTML = topo.regions.map(r => regionCard(r, CFG)).join("");
+    $("#poll-meta").textContent =
+      `保留期 ${topo.retain_sec}s · 队列容量 ${topo.queue_capacity} · ` +
+      `刷新 ${new Date().toLocaleTimeString()}`;
+  } catch (e) {
+    $("#poll-meta").textContent = "中继无响应：" + e.message;
+  }
+}
+poll();
+setInterval(poll, 1000);
+</script>
+</body>
+</html>

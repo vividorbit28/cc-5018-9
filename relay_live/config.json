@@ -1,0 +1,16 @@
+{
+  "regions": {
+    "east": {
+      "host": "127.0.0.1",
+      "port": 9100,
+      "control_port": 9101,
+      "label": "EAST-SRC"
+    },
+    "north": {
+      "host": "127.0.0.1",
+      "port": 9200,
+      "control_port": 9201,
+      "label": "NORTH-SRC"
+    }
+  }
+}
