@@ -174,10 +174,10 @@ function regionCard(r, cfg) {
 let CFG = null;
 async function poll() {
   try {
-    const [topo] = await Promise.all([
-      api("/api/topology"),
-      CFG || (CFG = api("/api/config").catch(() => null)),
-    ]);
+    if (!CFG) {
+      try { CFG = await api("/api/config"); } catch (e) { CFG = null; }
+    }
+    const topo = await api("/api/topology");
     if (!CFG) CFG = {regions: Object.fromEntries(
       topo.regions.map(r => [r.region, {control_port: 0}]))};
     $("#regions").innerHTML = topo.regions.map(r => regionCard(r, CFG)).join("");

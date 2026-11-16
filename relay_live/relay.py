@@ -25,6 +25,7 @@ import asyncio
 import json
 import os
 import signal
+import socket
 import subprocess
 import sys
 import time
@@ -55,6 +56,12 @@ class Subscriber:
         self.init_sent = False
         self.dropped = 0
         self.last_report = {}
+        # Buffered-copy accounting: bytes sitting in the bounded queue plus the
+        # single access unit currently being written to the worker socket.
+        self.queued_bytes = 0
+        self.inflight_bytes = 0
+        self.copies = 0                 # access units copied into this queue
+        self.copied_bytes = 0           # bytes copied into this queue
 
     def snapshot(self):
         r = self.last_report
@@ -74,6 +81,9 @@ class Subscriber:
             "dropped_for_this_viewer": self.dropped,
             "first_frame_ms": r.get("first_frame_ms"),
             "needs_keyframe": self.need_keyframe,
+            "queued_bytes": self.queued_bytes + self.inflight_bytes,
+            "copies": self.copies,
+            "copied_bytes": self.copied_bytes,
             "jpeg_b64": r.get("jpeg_b64"),
         }
 
@@ -91,15 +101,32 @@ class RegionKernel:
         self.subscribers = {}
         self.framer = AccessUnitFramer()
         self.latest_keyframe = b""      # full keyframe access unit
-        self.init_bytes = b""           # latest SPS/PPS
+        # Codec init is keyed by NAL type and therefore bounded (one SPS plus
+        # one PPS), no matter how many keyframes the encoder re-emits.
+        self._init_nal = {}
+        self._init_blob = b""
         self.au_sequence = 0
         self.upstream_bytes = 0
+        # Copy accounting for the shared-upstream cost breakdown. These are
+        # real Python-level byte copies, not logical bytes moved:
+        #   parse_copy_bytes      framer join per access unit (once per AU)
+        #   boundary_copy_bytes   init+keyframe prefix for a joining viewer
+        #   wire_copy_bytes       header+payload concatenation per viewer
+        self.parse_copy_bytes = 0
+        self.boundary_copy_bytes = 0
+        self.wire_copy_bytes = 0
         self.upstream_started_at = None
         self.retain_deadline = None
         self.retry_count = 0
         self.last_error = ""
         self.total_upstreams = 0        # how many upstreams ever established
+        # Generation counter. Every upstream gets a new epoch; a pump or
+        # teardown carrying an older epoch is ignored, so a re-entrant join
+        # can never be handed frames or have its connection closed by the
+        # previous generation's reader.
+        self.epoch = 0
         self._connect_task = None      # single-flight guard
+        self._pump_task = None
         self._reader = None
         self._writer = None
         self._retain_task = None
@@ -168,15 +195,22 @@ class RegionKernel:
             self._connect_task = None
             self._schedule_retry()
             raise RuntimeError(self.last_error)
+        # A new upstream is a new generation. Anything still running for an
+        # older generation (pump, teardown) is now stale and will no-op.
+        self.epoch += 1
+        epoch = self.epoch
         self._reader, self._writer = reader, writer
         self.total_upstreams += 1
         self.upstream_started_at = time.time()
         self.retry_count = 0
         self.framer = AccessUnitFramer()
         self.latest_keyframe = b""
+        self._init_nal = {}
+        self._init_blob = b""
         self._set_state("PLAYING")
         self._connect_task = None
-        asyncio.create_task(self._pump_upstream())
+        self._pump_task = asyncio.create_task(
+            self._pump_upstream(epoch, reader))
 
     def _schedule_retry(self):
         self.retry_count += 1
@@ -197,26 +231,36 @@ class RegionKernel:
             except RuntimeError:
                 pass
 
-    async def _pump_upstream(self):
+    async def _pump_upstream(self, epoch: int, reader):
         try:
             while True:
-                chunk = await self._reader.read(131072)
+                chunk = await reader.read(131072)
+                if epoch != self.epoch:
+                    # A newer upstream replaced this one while we were
+                    # blocked in read(). Its frames must not leak into the
+                    # current generation.
+                    return
                 if not chunk:
                     raise ConnectionResetError("source closed connection")
                 self.upstream_bytes += len(chunk)
                 for is_key, has_init, au in self.framer.push(chunk):
                     self.au_sequence += 1
+                    self.parse_copy_bytes += len(au)
                     if has_init:
                         for nal in iter_nals(au):
                             if nal.nal_type in (NAL_SPS, NAL_PPS):
-                                self.init_bytes += nal.data
+                                self._init_nal[nal.nal_type] = nal.data
+                        self._init_blob = b"".join(
+                            self._init_nal[k] for k in sorted(self._init_nal))
                     if is_key:
                         self.latest_keyframe = au
                     await self._fanout(is_key, has_init, au)
         except (ConnectionResetError, BrokenPipeError, OSError) as exc:
+            if epoch != self.epoch:
+                return  # stale generation: the new one owns recovery
             print(f"[relay:{self.region}] upstream broken: {exc!r}", flush=True)
             self.last_error = repr(exc)
-            self._teardown_upstream()
+            self._teardown_upstream(epoch)
             if self.subscribers:
                 self._set_state("FAILED")
                 # Every viewer must resync at the next keyframe after recover.
@@ -226,40 +270,59 @@ class RegionKernel:
                 self._schedule_retry()
             else:
                 self._set_state("IDLE")
+        except asyncio.CancelledError:
+            raise
 
     async def _fanout(self, is_key: bool, has_init: bool, au: bytes):
+        # One access unit is produced by the framer. Rather than copying the
+        # AU per viewer into each queue, the SAME bytes object is enqueued for
+        # every viewer that can take it. The bounded queue (and the ACK credit
+        # semaphore) are the only per-viewer state; a slow viewer's queue
+        # fills with references and drops on enqueue, which cannot grow memory
+        # beyond (capacity x live AU size) for that viewer.
+        init = self._init_blob or self.framer.init_bytes
         for sub in list(self.subscribers.values()):
             if sub.need_keyframe and not is_key:
                 continue  # never start a viewer on a non-decodable packet
-            payload_parts = []
             if sub.need_keyframe:
                 # Decodable boundary: codec init then the keyframe itself.
-                payload_parts.append(self.init_bytes or self.framer.init_bytes)
-                payload_parts.append(self.latest_keyframe or au)
+                # This is the only case that needs a new buffer (prefix +
+                # keyframe); steady-state shares the framer's AU directly.
+                payload = init + (self.latest_keyframe or au)
+                self.boundary_copy_bytes += len(payload)
                 sub.need_keyframe = False
                 sub.init_sent = True
-            elif has_init and is_key:
-                payload_parts.append(au)
             else:
-                payload_parts.append(au)
-            payload = b"".join(payload_parts)
-            # The bounded queue is the backpressure boundary. A full queue
-            # means the worker (via its ACK credits) cannot keep up: drop for
-            # THIS viewer only so it trends toward the newest picture while
-            # every other subscriber keeps its full rate.
+                payload = au
             if sub.queue.full():
                 sub.dropped += 1
                 continue
+            sub.copies += 1
+            sub.copied_bytes += len(payload)
+            sub.queued_bytes += len(payload)
             sub.queue.put_nowait((self.au_sequence, payload))
 
-    def _teardown_upstream(self):
-        if self._writer:
-            try:
-                self._writer.close()
-            except Exception:
-                pass
+    def _teardown_upstream(self, epoch: int = None):
+        if epoch is not None and epoch != self.epoch:
+            return  # a stale caller must not close the live connection
+        self.epoch += 1  # invalidate the reader/writer we just dropped
+        writer = self._writer
         self._reader = None
         self._writer = None
+        if writer:
+            try:
+                writer.close()
+            except Exception:
+                pass
+        task = self._pump_task
+        self._pump_task = None
+        if task is not None and not task.done():
+            try:
+                current = asyncio.current_task()
+            except RuntimeError:
+                current = None
+            if task is not current:
+                task.cancel()
 
     # ----------------------------------------------------------- retention
     async def leave(self, worker_id: str):
@@ -285,9 +348,14 @@ class RegionKernel:
         if not self.subscribers:
             print(f"[relay:{self.region}] retain window expired, releasing "
                   f"upstream", flush=True)
+            # Invalidate this generation before dropping the socket: a pump
+            # blocked in read() then discards its buffer instead of treating
+            # the local close as a source failure.
             self._teardown_upstream()
             self.latest_keyframe = b""
-            self.init_bytes = b""
+            self._init_nal = {}
+            self._init_blob = b""
+            self.framer = AccessUnitFramer()
             self._set_state("IDLE")
             self.retain_deadline = None
             self._retain_task = None
@@ -338,6 +406,16 @@ class RegionKernel:
         if sub is None:
             writer.close()
             return
+        # The stream socket carries tiny 8-byte headers immediately followed
+        # by the frame, on loopback, with the worker never waiting on our
+        # write. Without TCP_NODELAY the second small write can sit in Nagle
+        # until a delayed ACK, adding ~20-40 ms to first frame for no reason.
+        try:
+            sock = writer.get_extra_info("socket")
+            if sock is not None:
+                sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+        except OSError:
+            pass
         writer.write(b"READY\n")
         await writer.drain()
 
@@ -356,6 +434,7 @@ class RegionKernel:
         try:
             while True:
                 seq, payload = await sub.queue.get()
+                sub.queued_bytes -= len(payload)
                 # Block here until the worker has ACKed a previously consumed
                 # frame. A slow worker withholds ACKs, so this coroutine stops
                 # draining the queue and the bounded fanout queue fills ->
@@ -366,8 +445,14 @@ class RegionKernel:
                 # base64 overhead on the hot path.
                 header = len(payload).to_bytes(4, "big") + \
                     sub.dropped.to_bytes(4, "big")
-                writer.write(header + payload)
+                sub.inflight_bytes = len(payload)
+                # Write header and AU as separate transport chunks: one fewer
+                # full-frame copy than concatenating them for every viewer.
+                self.wire_copy_bytes += 8
+                writer.write(header)
+                writer.write(payload)
                 await writer.drain()
+                sub.inflight_bytes = 0
         except (ConnectionResetError, BrokenPipeError):
             pass
         finally:
@@ -402,10 +487,28 @@ class RegionKernel:
             "upstream_live": self.state in ("PLAYING", "RETAINING"),
             "upstream_bytes": self.upstream_bytes,
             "access_units": self.au_sequence,
+            "copy_cost": {
+                "parse_copy_bytes": self.parse_copy_bytes,
+                "boundary_copy_bytes": self.boundary_copy_bytes,
+                "wire_copy_bytes": self.wire_copy_bytes,
+                "total_copy_bytes": self.parse_copy_bytes
+                + self.boundary_copy_bytes + self.wire_copy_bytes,
+                "wire_bytes": self.upstream_bytes,
+            },
+            "cache_bytes": {
+                "latest_keyframe": len(self.latest_keyframe),
+                "init_bytes": len(self._init_blob),
+                "queued_bytes": sum(s.queued_bytes + s.inflight_bytes
+                                    for s in self.subscribers.values()),
+            },
             "retry_count": self.retry_count,
             "retain_seconds_left": retain_left,
             "last_error": self.last_error,
             "viewer_count": len(self.subscribers),
+            "queued_bytes_total": sum(s.queued_bytes + s.inflight_bytes
+                                      for s in self.subscribers.values()),
+            "copied_bytes_total": sum(s.copied_bytes
+                                      for s in self.subscribers.values()),
             "viewers": [s.snapshot() for s in self.subscribers.values()],
         }
 

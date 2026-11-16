@@ -71,13 +71,16 @@ class AccessUnitFramer:
     def __init__(self):
         self._units = []
         self._vcl_in_unit = False
-        self._init_bytes = b""  # latest SPS/PPS seen on the stream
+        # Latest SPS/PPS keyed by NAL type. Replacing instead of appending
+        # keeps the codec-init cache a fixed handful of bytes even though a
+        # live encoder re-emits parameter sets at every keyframe.
+        self._init = {}
 
     def push(self, chunk: bytes):
         out = []
         for nal in iter_nals(chunk):
             if nal.nal_type in (NAL_SPS, NAL_PPS):
-                self._init_bytes += nal.data
+                self._init[nal.nal_type] = nal.data
             # An access unit boundary is an AUD, or a VCL NAL when the unit
             # already buffered a VCL NAL (libx264 emits one slice per picture).
             # Parameter sets / SEI after a slice belong to the NEXT picture, so
@@ -100,7 +103,7 @@ class AccessUnitFramer:
 
     @property
     def init_bytes(self) -> bytes:
-        return self._init_bytes
+        return b"".join(self._init[k] for k in sorted(self._init))
 
 
 def http_get(url: str, timeout: float = 5.0):
